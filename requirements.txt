@@ -12,3 +12,4 @@ Pillow
 wandb
 tqdm
 huggingface_hub
+accelerate
