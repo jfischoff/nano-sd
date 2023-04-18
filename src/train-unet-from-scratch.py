@@ -625,14 +625,10 @@ def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
-    conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
-
     input_ids = torch.stack([example["input_ids"] for example in examples])
 
     batch = {
         "pixel_values": pixel_values,
-        "conditioning_pixel_values": conditioning_pixel_values,
         "input_ids": input_ids,
     }
     batch = {k: v.numpy() for k, v in batch.items()}
@@ -864,26 +860,11 @@ def main():
                 train=False,
             )[0]
 
-            controlnet_cond = minibatch["conditioning_pixel_values"]
-
-            # Predict the noise residual and compute loss
-            down_block_res_samples, mid_block_res_sample = controlnet.apply(
-                {"params": params},
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states,
-                controlnet_cond,
-                train=True,
-                return_dict=False,
-            )
-
             model_pred = unet.apply(
                 {"params": unet_params},
                 noisy_latents,
                 timesteps,
                 encoder_hidden_states,
-                down_block_additional_residuals=down_block_res_samples,
-                mid_block_additional_residual=mid_block_res_sample,
             ).sample
 
             # Get the target for loss depending on the prediction type
