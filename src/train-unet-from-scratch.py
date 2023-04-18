@@ -42,9 +42,8 @@ from transformers import CLIPTokenizer, FlaxCLIPTextModel, set_seed
 
 from diffusers import (
     FlaxAutoencoderKL,
-    FlaxControlNetModel,
     FlaxDDPMScheduler,
-    FlaxStableDiffusionControlNetPipeline,
+    FlaxStableDiffusionPipeline,
     FlaxUNet2DConditionModel,
 )
 from diffusers.utils import check_min_version, is_wandb_available
@@ -187,13 +186,6 @@ def parse_args():
         type=str,
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--controlnet_model_name_or_path",
-        type=str,
-        default=None,
-        help="Path to pretrained controlnet model or model identifier from huggingface.co/models."
-        " If not specified controlnet weights are initialized from unet.",
     )
     parser.add_argument(
         "--revision",
@@ -450,7 +442,7 @@ def parse_args():
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="train_controlnet_flax",
+        default="train_nano_sd_flax",
         help=("The `project` argument passed to wandb"),
     )
     parser.add_argument(
@@ -730,47 +722,9 @@ def main():
         from_pt=args.from_pt,
     )
 
-    if args.controlnet_model_name_or_path:
-        logger.info("Loading existing controlnet weights")
-        controlnet, controlnet_params = FlaxControlNetModel.from_pretrained(
-            args.controlnet_model_name_or_path,
-            revision=args.controlnet_revision,
-            from_pt=args.controlnet_from_pt,
-            dtype=jnp.float32,
-        )
-    else:
-        logger.info("Initializing controlnet weights from unet")
-        rng, rng_params = jax.random.split(rng)
-
-        controlnet = FlaxControlNetModel(
-            in_channels=unet.config.in_channels,
-            down_block_types=unet.config.down_block_types,
-            only_cross_attention=unet.config.only_cross_attention,
-            block_out_channels=unet.config.block_out_channels,
-            layers_per_block=unet.config.layers_per_block,
-            attention_head_dim=unet.config.attention_head_dim,
-            cross_attention_dim=unet.config.cross_attention_dim,
-            use_linear_projection=unet.config.use_linear_projection,
-            flip_sin_to_cos=unet.config.flip_sin_to_cos,
-            freq_shift=unet.config.freq_shift,
-        )
-        controlnet_params = controlnet.init_weights(rng=rng_params)
-        controlnet_params = unfreeze(controlnet_params)
-        for key in [
-            "conv_in",
-            "time_embedding",
-            "down_blocks_0",
-            "down_blocks_1",
-            "down_blocks_2",
-            "down_blocks_3",
-            "mid_block",
-        ]:
-            controlnet_params[key] = unet_params[key]
-
-    pipeline, pipeline_params = FlaxStableDiffusionControlNetPipeline.from_pretrained(
+    pipeline, pipeline_params = FlaxStableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         tokenizer=tokenizer,
-        controlnet=controlnet,
         safety_checker=None,
         dtype=weight_dtype,
         revision=args.revision,
@@ -797,7 +751,8 @@ def main():
         adamw,
     )
 
-    state = train_state.TrainState.create(apply_fn=controlnet.__call__, params=controlnet_params, tx=optimizer)
+    # Should this be the unet?
+    state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
 
     noise_scheduler, noise_scheduler_state = FlaxDDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
@@ -977,7 +932,7 @@ def main():
                 "total_train_batch_size": total_train_batch_size,
                 "total_optimization_step": args.num_train_epochs * num_update_steps_per_epoch,
                 "num_devices": jax.device_count(),
-                "controlnet_params": sum(np.prod(x.shape) for x in jax.tree_util.tree_leaves(state.params)),
+                "unet_params": sum(np.prod(x.shape) for x in jax.tree_util.tree_leaves(state.params)),
             }
         )
 
@@ -1054,7 +1009,7 @@ def main():
                 t0, step0 = time.monotonic(), global_step
                 train_metrics = []
             if global_step % args.checkpointing_steps == 0 and jax.process_index() == 0:
-                controlnet.save_pretrained(
+                unet.save_pretrained(
                     f"{args.output_dir}/{global_step}",
                     params=get_params_to_save(state.params),
                 )
@@ -1074,7 +1029,7 @@ def main():
         else:
             image_logs = None
 
-        controlnet.save_pretrained(
+        unet.save_pretrained(
             args.output_dir,
             params=get_params_to_save(state.params),
         )
