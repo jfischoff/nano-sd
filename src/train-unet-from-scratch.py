@@ -75,11 +75,10 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-def log_validation(pipeline, pipeline_params, controlnet_params, tokenizer, args, rng, weight_dtype):
+def log_validation(pipeline, pipeline_params, tokenizer, args, rng, weight_dtype):
     logger.info("Running validation...")
 
     pipeline_params = pipeline_params.copy()
-    pipeline_params["controlnet"] = controlnet_params
 
     num_samples = jax.device_count()
     prng_seed = jax.random.split(rng, jax.device_count())
@@ -180,12 +179,6 @@ def parse_args():
         help="Load the pretrained model from a PyTorch checkpoint.",
     )
     parser.add_argument(
-        "--controlnet_revision",
-        type=str,
-        default=None,
-        help="Revision of controlnet model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
         "--profile_steps",
         type=int,
         default=0,
@@ -206,11 +199,6 @@ def parse_args():
         type=str,
         default=None,
         help="Enables compilation cache.",
-    )
-    parser.add_argument(
-        "--controlnet_from_pt",
-        action="store_true",
-        help="Load the controlnet model from a PyTorch checkpoint.",
     )
     parser.add_argument(
         "--tokenizer_name",
@@ -725,7 +713,7 @@ def main():
         snr = (alpha / sigma) ** 2
         return snr
 
-    def train_step(state, unet_params, text_encoder_params, vae_params, batch, train_rng):
+    def train_step(state, text_encoder_params, vae_params, batch, train_rng):
         # reshape batch, add grad_step_dim if gradient_accumulation_steps > 1
         if args.gradient_accumulation_steps > 1:
             grad_steps = args.gradient_accumulation_steps
@@ -765,7 +753,7 @@ def main():
             )[0]
 
             model_pred = unet.apply(
-                {"params": unet_params},
+                {"params": params},
                 noisy_latents,
                 timesteps,
                 encoder_hidden_states,
@@ -848,7 +836,6 @@ def main():
 
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
-    unet_params = jax_utils.replicate(unet_params)
     text_encoder_params = jax_utils.replicate(text_encoder.params)
     vae_params = jax_utils.replicate(vae_params)
 
@@ -925,7 +912,7 @@ def main():
             batch = shard(batch)
             with jax.profiler.StepTraceAnnotation("train", step_num=global_step):
                 state, train_metric, train_rngs = p_train_step(
-                    state, unet_params, text_encoder_params, vae_params, batch, train_rngs
+                    state, text_encoder_params, vae_params, batch, train_rngs
                 )
             train_metrics.append(train_metric)
 
