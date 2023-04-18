@@ -166,7 +166,6 @@ tags:
 - stable-diffusion-diffusers
 - text-to-image
 - diffusers
-- controlnet
 - jax-diffusers-event
 inference: true
 ---
@@ -174,7 +173,7 @@ inference: true
     model_card = f"""
 # controlnet- {repo_id}
 
-These are controlnet weights trained on {base_model} with new type of conditioning. You can find some example images in the following. \n
+These are unet weights trained scratch but using {base_model} for everything else. \n
 {img_str}
 """
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
@@ -395,12 +394,6 @@ def parse_args():
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
     )
     parser.add_argument(
-        "--conditioning_image_column",
-        type=str,
-        default="conditioning_image",
-        help="The column of the dataset containing the controlnet conditioning image.",
-    )
-    parser.add_argument(
         "--caption_column",
         type=str,
         default="text",
@@ -563,16 +556,6 @@ def make_train_dataset(args, tokenizer, batch_size=None):
                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
-    if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[2]
-        logger.info(f"conditioning image column defaulting to {caption_column}")
-    else:
-        conditioning_image_column = args.conditioning_image_column
-        if conditioning_image_column not in column_names:
-            raise ValueError(
-                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
     def tokenize_captions(examples, is_train=True):
         captions = []
         for caption in examples[caption_column]:
@@ -613,11 +596,7 @@ def make_train_dataset(args, tokenizer, batch_size=None):
         images = [image.convert("RGB") for image in examples[image_column]]
         images = [image_transforms(image) for image in images]
 
-        conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
-
         examples["pixel_values"] = images
-        examples["conditioning_pixel_values"] = conditioning_images
         examples["input_ids"] = tokenize_captions(examples)
 
         return examples
