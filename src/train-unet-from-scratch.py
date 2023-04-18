@@ -84,33 +84,17 @@ def log_validation(pipeline, pipeline_params, controlnet_params, tokenizer, args
     num_samples = jax.device_count()
     prng_seed = jax.random.split(rng, jax.device_count())
 
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
-    else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
-
+    validation_prompts = args.validation_prompt
+    
     image_logs = []
 
-    for validation_prompt, validation_image in zip(validation_prompts, validation_images):
+    for validation_prompt in validation_prompts:
         prompts = num_samples * [validation_prompt]
         prompt_ids = pipeline.prepare_text_inputs(prompts)
         prompt_ids = shard(prompt_ids)
 
-        validation_image = Image.open(validation_image).convert("RGB")
-        processed_image = pipeline.prepare_image_inputs(num_samples * [validation_image])
-        processed_image = shard(processed_image)
         images = pipeline(
             prompt_ids=prompt_ids,
-            image=processed_image,
             params=pipeline_params,
             prng_seed=prng_seed,
             num_inference_steps=50,
@@ -121,7 +105,7 @@ def log_validation(pipeline, pipeline_params, controlnet_params, tokenizer, args
         images = pipeline.numpy_to_pil(images)
 
         image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
+            {"images": images, "validation_prompt": validation_prompt}
         )
 
     if args.report_to == "wandb":
@@ -129,9 +113,7 @@ def log_validation(pipeline, pipeline_params, controlnet_params, tokenizer, args
         for log in image_logs:
             images = log["images"]
             validation_prompt = log["validation_prompt"]
-            validation_image = log["validation_image"]
 
-            formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
             for image in images:
                 image = wandb.Image(image, caption=validation_prompt)
                 formatted_images.append(image)
@@ -149,10 +131,9 @@ def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=N
         for i, log in enumerate(image_logs):
             images = log["images"]
             validation_prompt = log["validation_prompt"]
-            validation_image = log["validation_image"]
-            validation_image.save(os.path.join(repo_folder, "image_control.png"))
+            
             img_str += f"prompt: {validation_prompt}\n"
-            images = [validation_image] + images
+            images = images
             image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
             img_str += f"![images_{i})](./images_{i}.png)\n"
 
@@ -413,20 +394,6 @@ def parse_args():
         nargs="+",
         help=(
             "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
-            " Provide either a matching number of `--validation_image`s, a single `--validation_image`"
-            " to be used with all prompts, or a single prompt that will be used with all `--validation_image`s."
-        ),
-    )
-    parser.add_argument(
-        "--validation_image",
-        type=str,
-        default=None,
-        nargs="+",
-        help=(
-            "A set of paths to the controlnet conditioning image be evaluated every `--validation_steps`"
-            " and logged to `--report_to`. Provide either a matching number of `--validation_prompt`s, a"
-            " a single `--validation_prompt` to be used with all `--validation_image`s, or a single"
-            " `--validation_image` that will be used with all `--validation_prompt`s."
         ),
     )
     parser.add_argument(
@@ -465,24 +432,6 @@ def parse_args():
 
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
-
-    if args.validation_prompt is not None and args.validation_image is None:
-        raise ValueError("`--validation_image` must be set if `--validation_prompt` is set")
-
-    if args.validation_prompt is None and args.validation_image is not None:
-        raise ValueError("`--validation_prompt` must be set if `--validation_image` is set")
-
-    if (
-        args.validation_image is not None
-        and args.validation_prompt is not None
-        and len(args.validation_image) != 1
-        and len(args.validation_prompt) != 1
-        and len(args.validation_image) != len(args.validation_prompt)
-    ):
-        raise ValueError(
-            "Must provide either 1 `--validation_image`, 1 `--validation_prompt`,"
-            " or the same number of `--validation_prompt`s and `--validation_image`s"
-        )
 
     # This idea comes from
     # https://github.com/borisdayma/dalle-mini/blob/d2be512d4a6a9cda2d63ba04afc33038f98f705f/src/dalle_mini/data.py#L370
