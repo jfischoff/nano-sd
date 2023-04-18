@@ -651,13 +651,9 @@ def main():
         dtype=weight_dtype,
         from_pt=args.from_pt,
     )
-    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        dtype=weight_dtype,
-        revision=args.revision,
-        from_pt=args.from_pt,
-    )
+
+    unet_config = FlaxUNet2DConditionModel.load_config(args.pretrained_model_name_or_path, subfolder="unet")
+    unet, unet_params = unet.from_config(unet_config)
 
     pipeline, pipeline_params = FlaxStableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
