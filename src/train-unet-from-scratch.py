@@ -17,7 +17,6 @@ import argparse
 import logging
 import math
 import os
-import random
 import time
 from pathlib import Path
 
@@ -25,29 +24,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import torch
-import torch.utils.checkpoint
 import transformers
-from datasets import load_dataset, load_from_disk
+import webdataset as wds
+from diffusers import (FlaxAutoencoderKL, FlaxDDPMScheduler, FlaxPNDMScheduler,
+                       FlaxStableDiffusionPipeline, FlaxUNet2DConditionModel)
+from diffusers.utils import check_min_version, is_wandb_available
 from flax import jax_utils
-from flax.core.frozen_dict import unfreeze
 from flax.training import train_state
 from flax.training.common_utils import shard
-from huggingface_hub import create_repo, upload_folder
-from PIL import Image, PngImagePlugin
-from torch.utils.data import IterableDataset
+from PIL import PngImagePlugin
+from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, FlaxCLIPTextModel, set_seed
 
-from diffusers import (
-    FlaxAutoencoderKL,
-    FlaxDDPMScheduler,
-    FlaxStableDiffusionPipeline,
-    FlaxUNet2DConditionModel,
-)
-from diffusers.utils import check_min_version, is_wandb_available
-
+from hf_utils import publish_to_hub
 
 # To prevent an error that occurs when there are abnormally large compressed data chunk in the png image
 # see more https://github.com/python-pillow/Pillow/issues/5610
@@ -63,39 +54,27 @@ check_min_version("0.16.0.dev0")
 logger = logging.getLogger(__name__)
 
 
-def image_grid(imgs, rows, cols):
-    assert len(imgs) == rows * cols
-
-    w, h = imgs[0].size
-    grid = Image.new("RGB", size=(cols * w, rows * h))
-    grid_w, grid_h = grid.size
-
-    for i, img in enumerate(imgs):
-        grid.paste(img, box=(i % cols * w, i // cols * h))
-    return grid
-
-
-def log_validation(pipeline, pipeline_params, tokenizer, args, rng, weight_dtype):
+def generate_images(pipeline, pipeline_params, prompts, rng, report_to: str = "", size=128):
     logger.info("Running validation...")
 
+    # TODO(bruno): Why do we need to copy the params?
     pipeline_params = pipeline_params.copy()
 
     num_samples = jax.device_count()
     prng_seed = jax.random.split(rng, jax.device_count())
 
-    validation_prompts = args.validation_prompt
-    
     image_logs = []
-
-    for validation_prompt in validation_prompts:
-        prompts = num_samples * [validation_prompt]
-        prompt_ids = pipeline.prepare_text_inputs(prompts)
+    for prompt in prompts:
+        ps = num_samples * [prompt]
+        prompt_ids = pipeline.prepare_inputs(ps)
         prompt_ids = shard(prompt_ids)
 
         images = pipeline(
             prompt_ids=prompt_ids,
             params=pipeline_params,
             prng_seed=prng_seed,
+            height=size,
+            width=size,
             num_inference_steps=50,
             jit=True,
         ).images
@@ -104,59 +83,24 @@ def log_validation(pipeline, pipeline_params, tokenizer, args, rng, weight_dtype
         images = pipeline.numpy_to_pil(images)
 
         image_logs.append(
-            {"images": images, "validation_prompt": validation_prompt}
+            {"images": images, "validation_prompt": prompt}
         )
 
-    if args.report_to == "wandb":
+    if report_to == "wandb":
         formatted_images = []
         for log in image_logs:
             images = log["images"]
-            validation_prompt = log["validation_prompt"]
+            prompt = log["validation_prompt"]
 
             for image in images:
-                image = wandb.Image(image, caption=validation_prompt)
+                image = wandb.Image(image, caption=prompt)
                 formatted_images.append(image)
 
         wandb.log({"validation": formatted_images})
-    else:
-        logger.warn(f"image logging not implemented for {args.report_to}")
+    elif report_to != "":
+        logger.warn("image logging only implemented for wandb")
 
     return image_logs
-
-
-def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
-    img_str = ""
-    if image_logs is not None:
-        for i, log in enumerate(image_logs):
-            images = log["images"]
-            validation_prompt = log["validation_prompt"]
-            
-            img_str += f"prompt: {validation_prompt}\n"
-            images = images
-            image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
-            img_str += f"![images_{i})](./images_{i}.png)\n"
-
-    yaml = f"""
----
-license: creativeml-openrail-m
-base_model: {base_model}
-tags:
-- stable-diffusion
-- stable-diffusion-diffusers
-- text-to-image
-- diffusers
-- jax-diffusers-event
-inference: true
----
-    """
-    model_card = f"""
-# controlnet- {repo_id}
-
-These are unet weights trained scratch but using {base_model} for everything else. \n
-{img_str}
-"""
-    with open(os.path.join(repo_folder, "README.md"), "w") as f:
-        f.write(yaml + model_card)
 
 
 def parse_args():
@@ -164,7 +108,8 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        required=True,
+        required=False,
+        default='runwayml/stable-diffusion-v1-5',
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -223,7 +168,7 @@ def parse_args():
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=128,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -232,7 +177,7 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -302,7 +247,7 @@ def parse_args():
     parser.add_argument(
         "--report_to",
         type=str,
-        default="wandb",
+        default="",
         help=('The integration to report the results and logs to. Currently only supported platforms are `"wandb"`'),
     )
     parser.add_argument(
@@ -336,7 +281,7 @@ def parse_args():
     parser.add_argument(
         "--train_data_dir",
         type=str,
-        default=None,
+        default='/mnt/disks/persist/datasets/improved_aesthetics_6plus_data/',
         help=(
             "A folder containing the training dataset. By default it will use `load_dataset` method to load a custom dataset from the folder."
             "Folder must contain a dataset script as described here https://huggingface.co/docs/datasets/dataset_script) ."
@@ -421,6 +366,9 @@ def parse_args():
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
+    if args.push_to_hub and args.hub_model_id is None:
+        raise ValueError("You must specify `hub_model_id` when `--push_to_hub` is True.")
+
     # This idea comes from
     # https://github.com/borisdayma/dalle-mini/blob/d2be512d4a6a9cda2d63ba04afc33038f98f705f/src/dalle_mini/data.py#L370
     if args.streaming and args.max_train_samples is None:
@@ -429,139 +377,44 @@ def parse_args():
     return args
 
 
-def make_train_dataset(args, tokenizer, batch_size=None):
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+def wds_dataset(data_folder: str, tokenizer, size: int = 128):
+    """Returns a WebDataset data pipeline for the given path.
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            streaming=args.streaming,
+    Expects the path to be a folder containing tar files with images.
+    """
+
+    def preprocess_fn(sample):
+        image_transforms = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
         )
-    else:
-        if args.train_data_dir is not None:
-            if args.load_from_disk:
-                dataset = load_from_disk(
-                    args.train_data_dir,
-                )
-            else:
-                dataset = load_dataset(
-                    args.train_data_dir,
-                    cache_dir=args.cache_dir,
-                )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+        img = image_transforms(sample["jpg"]).numpy()
 
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    if isinstance(dataset["train"], IterableDataset):
-        column_names = next(iter(dataset["train"])).keys()
-    else:
-        column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    if args.image_column is None:
-        image_column = column_names[0]
-        logger.info(f"image column defaulting to {image_column}")
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.caption_column is None:
-        caption_column = column_names[1]
-        logger.info(f"caption column defaulting to {caption_column}")
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if random.random() < args.proportion_empty_prompts:
-                captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
+        caption = sample['json']['caption']
         inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            caption, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="np"
         )
-        return inputs.input_ids
 
-    image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
+        # FIXME(bruno): We should try to bach the inputs to preprocess_fn to
+        # avoid this squeeze.
+        return {"jpg": img, "text": inputs.input_ids.squeeze(0)}
+
+    tar_files = list(Path(data_folder).glob("*.tar"))
+    ds = wds.DataPipeline(
+        wds.ResampledShards([str(f) for f in tar_files]),
+        wds.tarfile_to_samples(),
+        wds.shuffle(1000),
+        wds.decode("torchrgb"),
+        wds.map(preprocess_fn),
+        wds.to_tuple("jpg", "text"),
     )
 
-    conditioning_image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-        ]
-    )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        images = [image_transforms(image) for image in images]
-
-        examples["pixel_values"] = images
-        examples["input_ids"] = tokenize_captions(examples)
-
-        return examples
-
-    if jax.process_index() == 0:
-        if args.max_train_samples is not None:
-            if args.streaming:
-                dataset["train"] = dataset["train"].shuffle(seed=args.seed).take(args.max_train_samples)
-            else:
-                dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        if args.streaming:
-            train_dataset = dataset["train"].map(
-                preprocess_train,
-                batched=True,
-                batch_size=batch_size,
-                remove_columns=list(dataset["train"].features.keys()),
-            )
-        else:
-            train_dataset = dataset["train"].with_transform(preprocess_train)
-
-    return train_dataset
-
-
-def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    input_ids = torch.stack([example["input_ids"] for example in examples])
-
-    batch = {
-        "pixel_values": pixel_values,
-        "input_ids": input_ids,
-    }
-    batch = {k: v.numpy() for k, v in batch.items()}
-    return batch
+    return ds
 
 
 def get_params_to_save(params):
@@ -602,11 +455,6 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-        if args.push_to_hub:
-            repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
-            ).repo_id
-
     # Load the tokenizer and add the placeholder token as a additional special token
     if args.tokenizer_name:
         tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
@@ -617,17 +465,14 @@ def main():
     else:
         raise NotImplementedError("No tokenizer specified!")
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
     total_train_batch_size = args.train_batch_size * jax.local_device_count() * args.gradient_accumulation_steps
-    train_dataset = make_train_dataset(args, tokenizer, batch_size=total_train_batch_size)
-
-    train_dataloader = torch.utils.data.DataLoader(
+    train_dataset = wds_dataset(args.train_data_dir, tokenizer, size=args.resolution)
+    train_dataloader = DataLoader(
         train_dataset,
-        shuffle=not args.streaming,
-        collate_fn=collate_fn,
         batch_size=total_train_batch_size,
         num_workers=args.dataloader_num_workers,
         drop_last=True,
+        persistent_workers=True if args.dataloader_num_workers > 0 else False,
     )
 
     weight_dtype = jnp.float32
@@ -652,17 +497,40 @@ def main():
         from_pt=args.from_pt,
     )
 
-    unet_config = FlaxUNet2DConditionModel.load_config(args.pretrained_model_name_or_path, subfolder="unet")
-    unet, unet_params = unet.from_config(unet_config)
-
-    pipeline, pipeline_params = FlaxStableDiffusionPipeline.from_pretrained(
+    # TODO(bruno): Replace pretrained unet with one initialized from scratch.
+    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
-        tokenizer=tokenizer,
-        safety_checker=None,
+        subfolder="unet",
         dtype=weight_dtype,
         revision=args.revision,
         from_pt=args.from_pt,
     )
+    # unet_config = FlaxUNet2DConditionModel.load_config(args.pretrained_model_name_or_path, subfolder="unet")
+    # unet, unet_params = FlaxUNet2DConditionModel.from_config(unet_config)
+
+    scheduler, scheduler_params = FlaxPNDMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="scheduler",
+        dtype=weight_dtype,
+        revision=args.revision,
+        from_pt=args.from_pt,
+    )
+
+    pipeline = FlaxStableDiffusionPipeline(
+        vae=vae,
+        unet=unet,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        safety_checker=None,
+        scheduler=scheduler,
+        feature_extractor=None,
+    )
+    pipeline_params = {
+        'unet': unet_params,
+        'vae': vae_params,
+        'text_encoder': text_encoder.params,
+        'scheduler': scheduler_params,
+    }
     pipeline_params = jax_utils.replicate(pipeline_params)
 
     # Optimization
@@ -717,8 +585,9 @@ def main():
 
         def compute_loss(params, minibatch, sample_rng):
             # Convert images to latent space
+            images, caption_tokens = minibatch[0], minibatch[1]
             vae_outputs = vae.apply(
-                {"params": vae_params}, minibatch["pixel_values"], deterministic=True, method=vae.encode
+                {"params": vae_params}, images, deterministic=True, method=vae.encode
             )
             latents = vae_outputs.latent_dist.sample(sample_rng)
             # (NHWC) -> (NCHW)
@@ -743,7 +612,7 @@ def main():
 
             # Get the text embedding for conditioning
             encoder_hidden_states = text_encoder(
-                minibatch["input_ids"],
+                caption_tokens,
                 params=text_encoder_params,
                 train=False,
             )[0]
@@ -835,6 +704,7 @@ def main():
     text_encoder_params = jax_utils.replicate(text_encoder.params)
     vae_params = jax_utils.replicate(vae_params)
 
+
     # Train!
     if args.streaming:
         dataset_length = args.max_train_samples
@@ -897,6 +767,7 @@ def main():
             disable=jax.process_index() > 0,
         )
         # train
+
         for batch in train_dataloader:
             if args.profile_steps and global_step == 1:
                 train_metric["loss"].block_until_ready()
@@ -905,7 +776,7 @@ def main():
                 train_metric["loss"].block_until_ready()
                 jax.profiler.stop_trace()
 
-            batch = shard(batch)
+            batch = shard([jnp.array(batch[0]), jnp.array(batch[1])])
             with jax.profiler.StepTraceAnnotation("train", step_num=global_step):
                 state, train_metric, train_rngs = p_train_step(
                     state, text_encoder_params, vae_params, batch, train_rngs
@@ -923,7 +794,7 @@ def main():
                 and global_step % args.validation_steps == 0
                 and jax.process_index() == 0
             ):
-                _ = log_validation(pipeline, pipeline_params, state.params, tokenizer, args, validation_rng, weight_dtype)
+                _ = generate_images(pipeline, pipeline_params, args.validation_prompt, validation_rng, report_to=args.report_to, size=args.resolution)
 
             if global_step % args.logging_steps == 0 and jax.process_index() == 0:
                 if args.report_to == "wandb":
@@ -955,7 +826,7 @@ def main():
         if args.validation_prompt is not None:
             if args.profile_validation:
                 jax.profiler.start_trace(args.output_dir)
-            image_logs = log_validation(pipeline, pipeline_params, state.params, tokenizer, args, validation_rng, weight_dtype)
+            image_logs = generate_images(pipeline, pipeline_params, args.validation_prompt, validation_rng, report_to=args.report_to, size=args.resolution)
             if args.profile_validation:
                 jax.profiler.stop_trace()
         else:
@@ -967,17 +838,12 @@ def main():
         )
 
         if args.push_to_hub:
-            save_model_card(
-                repo_id,
+            publish_to_hub(
+                repo_id=args.hub_model_id,
+                token=args.hub_token,
                 image_logs=image_logs,
                 base_model=args.pretrained_model_name_or_path,
-                repo_folder=args.output_dir,
-            )
-            upload_folder(
-                repo_id=repo_id,
                 folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
             )
 
     if args.profile_memory:
