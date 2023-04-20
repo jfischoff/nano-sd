@@ -24,9 +24,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import torch
 import transformers
 import webdataset as wds
-from diffusers import (FlaxAutoencoderKL, FlaxDDPMScheduler, FlaxPNDMScheduler,
+from diffusers import (FlaxAutoencoderKL, FlaxDPMSolverMultistepScheduler,
                        FlaxStableDiffusionPipeline, FlaxUNet2DConditionModel)
 from diffusers.utils import check_min_version, is_wandb_available
 from flax import jax_utils
@@ -54,11 +55,13 @@ check_min_version("0.16.0.dev0")
 logger = logging.getLogger(__name__)
 
 
-def generate_images(pipeline, pipeline_params, prompts, rng, report_to: str = "", size=128):
+def generate_images(pipeline, pipeline_params, unet_params, prompts, rng, report_to: str = "", size=128):
     logger.info("Running validation...")
 
-    # TODO(bruno): Why do we need to copy the params?
+    # Copy the pipeline parameters into a new dict and update the unet parameters
+    # with the ones from the training loop.
     pipeline_params = pipeline_params.copy()
+    pipeline_params['unet'] = unet_params
 
     num_samples = jax.device_count()
     prng_seed = jax.random.split(rng, jax.device_count())
@@ -89,11 +92,11 @@ def generate_images(pipeline, pipeline_params, prompts, rng, report_to: str = ""
     if report_to == "wandb":
         formatted_images = []
         for log in image_logs:
-            images = log["images"]
-            prompt = log["validation_prompt"]
+            generated_images = log["images"]
+            validation_prompt = log["validation_prompt"]
 
-            for image in images:
-                image = wandb.Image(image, caption=prompt)
+            for image in generated_images:
+                image = wandb.Image(image, caption=validation_prompt)
                 formatted_images.append(image)
 
         wandb.log({"validation": formatted_images})
@@ -109,7 +112,7 @@ def parse_args():
         "--pretrained_model_name_or_path",
         type=str,
         required=False,
-        default='runwayml/stable-diffusion-v1-5',
+        default='bguisard/stable-diffusion-nano',
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -146,15 +149,9 @@ def parse_args():
         help="Enables compilation cache.",
     )
     parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default=None,
-        help="Pretrained tokenizer name or path if not the same as model_name",
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
-        default="runs/{timestamp}",
+        default="/mnt/disks/persist/runs/{timestamp}",
         help="The output directory where the model predictions and checkpoints will be written. "
         "Can contain placeholders: {timestamp}.",
     )
@@ -376,6 +373,31 @@ def parse_args():
 
     return args
 
+# Based on the TokenizerWrapper from CLOOB
+# https://github.com/crowsonkb/cloob-training/blob/de137c19b13edb086901d32b795fd519949b9e31/train.py#L33
+class TokenizerWrapper:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, texts):
+        if isinstance(texts, str):
+            texts = [texts]
+        return self.tokenizer(
+            texts,
+            max_length=self.tokenizer.model_max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids
+
+
+# Forked from CLOOB
+# https://github.com/crowsonkb/cloob-training/blob/de137c19b13edb086901d32b795fd519949b9e31/train.py#L52
+class RandomItem:
+    def __call__(self, batch):
+        index = torch.randint(len(batch), [])
+        return batch[index]
+
 
 def wds_dataset(data_folder: str, tokenizer, size: int = 128):
     """Returns a WebDataset data pipeline for the given path.
@@ -383,26 +405,21 @@ def wds_dataset(data_folder: str, tokenizer, size: int = 128):
     Expects the path to be a folder containing tar files with images.
     """
 
-    def preprocess_fn(sample):
-        image_transforms = transforms.Compose(
-            [
-                transforms.ToPILImage(),
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-        img = image_transforms(sample["jpg"]).numpy()
-
-        caption = sample['json']['caption']
-        inputs = tokenizer(
-            caption, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="np"
-        )
-
-        # FIXME(bruno): We should try to bach the inputs to preprocess_fn to
-        # avoid this squeeze.
-        return {"jpg": img, "text": inputs.input_ids.squeeze(0)}
+    image_transforms = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+    text_transforms = transforms.Compose(
+        [
+            TokenizerWrapper(tokenizer),
+            RandomItem(),
+        ]
+    )
 
     tar_files = list(Path(data_folder).glob("*.tar"))
     ds = wds.DataPipeline(
@@ -410,10 +427,9 @@ def wds_dataset(data_folder: str, tokenizer, size: int = 128):
         wds.tarfile_to_samples(),
         wds.shuffle(1000),
         wds.decode("torchrgb"),
-        wds.map(preprocess_fn),
-        wds.to_tuple("jpg", "text"),
+        wds.to_tuple("jpg", "txt"),
+        wds.map_tuple(image_transforms, text_transforms),
     )
-
     return ds
 
 
@@ -455,26 +471,6 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load the tokenizer and add the placeholder token as a additional special token
-    if args.tokenizer_name:
-        tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
-    elif args.pretrained_model_name_or_path:
-        tokenizer = CLIPTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-        )
-    else:
-        raise NotImplementedError("No tokenizer specified!")
-
-    total_train_batch_size = args.train_batch_size * jax.local_device_count() * args.gradient_accumulation_steps
-    train_dataset = wds_dataset(args.train_data_dir, tokenizer, size=args.resolution)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=total_train_batch_size,
-        num_workers=args.dataloader_num_workers,
-        drop_last=True,
-        persistent_workers=True if args.dataloader_num_workers > 0 else False,
-    )
-
     weight_dtype = jnp.float32
     if args.mixed_precision == "fp16":
         weight_dtype = jnp.float16
@@ -482,6 +478,13 @@ def main():
         weight_dtype = jnp.bfloat16
 
     # Load models and create wrapper for stable diffusion
+    tokenizer = CLIPTokenizer.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="tokenizer",
+            dtype=weight_dtype,
+            revision=args.revision,
+            from_pt=args.from_pt,
+    )
     text_encoder = FlaxCLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="text_encoder",
@@ -508,7 +511,7 @@ def main():
     # unet_config = FlaxUNet2DConditionModel.load_config(args.pretrained_model_name_or_path, subfolder="unet")
     # unet, unet_params = FlaxUNet2DConditionModel.from_config(unet_config)
 
-    scheduler, scheduler_params = FlaxPNDMScheduler.from_pretrained(
+    noise_scheduler, noise_scheduler_state = FlaxDPMSolverMultistepScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
         dtype=weight_dtype,
@@ -522,14 +525,15 @@ def main():
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         safety_checker=None,
-        scheduler=scheduler,
+        scheduler=noise_scheduler,
         feature_extractor=None,
+        dtype=weight_dtype,
     )
     pipeline_params = {
         'unet': unet_params,
         'vae': vae_params,
         'text_encoder': text_encoder.params,
-        'scheduler': scheduler_params,
+        'scheduler': noise_scheduler_state,
     }
     pipeline_params = jax_utils.replicate(pipeline_params)
 
@@ -555,9 +559,6 @@ def main():
     # Should this be the unet?
     state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
 
-    noise_scheduler, noise_scheduler_state = FlaxDDPMScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
-    )
 
     # Initialize our training
     validation_rng, train_rngs = jax.random.split(rng)
@@ -704,6 +705,16 @@ def main():
     text_encoder_params = jax_utils.replicate(text_encoder.params)
     vae_params = jax_utils.replicate(vae_params)
 
+    # Generate training set
+    total_train_batch_size = args.train_batch_size * jax.local_device_count() * args.gradient_accumulation_steps
+    train_dataset = wds_dataset(args.train_data_dir, tokenizer, size=args.resolution)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=total_train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+        persistent_workers=True if args.dataloader_num_workers > 0 else False,
+    )
 
     # Train!
     if args.streaming:
@@ -794,7 +805,7 @@ def main():
                 and global_step % args.validation_steps == 0
                 and jax.process_index() == 0
             ):
-                _ = generate_images(pipeline, pipeline_params, args.validation_prompt, validation_rng, report_to=args.report_to, size=args.resolution)
+                _ = generate_images(pipeline, pipeline_params, state.params, args.validation_prompt, validation_rng, report_to=args.report_to, size=args.resolution)
 
             if global_step % args.logging_steps == 0 and jax.process_index() == 0:
                 if args.report_to == "wandb":
@@ -826,7 +837,7 @@ def main():
         if args.validation_prompt is not None:
             if args.profile_validation:
                 jax.profiler.start_trace(args.output_dir)
-            image_logs = generate_images(pipeline, pipeline_params, args.validation_prompt, validation_rng, report_to=args.report_to, size=args.resolution)
+            image_logs = generate_images(pipeline, pipeline_params, state.params, args.validation_prompt, validation_rng, report_to=args.report_to, size=args.resolution)
             if args.profile_validation:
                 jax.profiler.stop_trace()
         else:
