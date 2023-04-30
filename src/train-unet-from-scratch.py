@@ -27,7 +27,8 @@ import optax
 import torch
 import transformers
 import webdataset as wds
-from diffusers import (FlaxAutoencoderKL, FlaxDPMSolverMultistepScheduler,
+from diffusers import (FlaxAutoencoderKL, FlaxDDIMScheduler,
+                       FlaxDPMSolverMultistepScheduler, FlaxPNDMScheduler,
                        FlaxStableDiffusionPipeline, FlaxUNet2DConditionModel)
 from diffusers.utils import check_min_version, is_wandb_available
 from flax import jax_utils
@@ -511,10 +512,14 @@ def main():
     # unet_config = FlaxUNet2DConditionModel.load_config(args.pretrained_model_name_or_path, subfolder="unet")
     # unet, unet_params = FlaxUNet2DConditionModel.from_config(unet_config)
 
-    noise_scheduler, noise_scheduler_state = FlaxDPMSolverMultistepScheduler.from_pretrained(
+    # NOTE(bruno): There is an issue with the pipeline inference when using a
+    # mixed precision noise scheduler.
+    #
+    # See: https://github.com/huggingface/diffusers/issues/2155
+    noise_scheduler, noise_scheduler_state = FlaxPNDMScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
-        dtype=weight_dtype,
+        dtype=jnp.float32,
         revision=args.revision,
         from_pt=args.from_pt,
     )
@@ -638,7 +643,9 @@ def main():
             if args.snr_gamma is not None:
                 snr = jnp.array(compute_snr(timesteps))
                 snr_loss_weights = jnp.where(snr < args.snr_gamma, snr, jnp.ones_like(snr) * args.snr_gamma) / snr
-                loss = loss * snr_loss_weights
+
+                per_sample_loss = loss.mean(axis=list(range(1, len(loss.shape))))
+                loss = snr_loss_weights * per_sample_loss
 
             loss = loss.mean()
 
